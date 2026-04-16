@@ -162,3 +162,7 @@ else
   echo "To send results back manually:"
   echo "  runpodctl send $OUTPUT_ARCHIVE"
 fi
+if command -v runpodctl >/dev/null 2>&1; then
+  echo "Terminating pod..."
+  runpodctl stop pod "$RUNPOD_POD_ID"
+fi
