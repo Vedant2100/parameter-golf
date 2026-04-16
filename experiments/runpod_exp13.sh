@@ -116,6 +116,20 @@ else
   echo "torchrun not found; using fallback launcher: ${TORCH_LAUNCHER[*]}"
 fi
 
+if [ -z "${NPROC_PER_NODE:-}" ]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC_PER_NODE="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    NPROC_PER_NODE="$(python3 -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo 0)"
+  fi
+fi
+
+if [ "${NPROC_PER_NODE:-0}" -lt 1 ]; then
+  echo "No visible GPUs detected (NPROC_PER_NODE=$NPROC_PER_NODE)."
+  exit 1
+fi
+echo "Using nproc_per_node=$NPROC_PER_NODE"
+
 RUN_ID="$RUN_ID" \
 DATA_PATH="$DATA_PATH" \
 TOKENIZER_PATH="$TOKENIZER_PATH" \
@@ -139,7 +153,7 @@ QK_GAIN_INIT="${QK_GAIN_INIT:-2.5}" \
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}" \
 EMA_DECAY="${EMA_DECAY:-0.995}" \
 EMA_START_STEP="${EMA_START_STEP:-1000}" \
-"${TORCH_LAUNCHER[@]}" --standalone --nproc_per_node=8 train_gpt.py
+"${TORCH_LAUNCHER[@]}" --standalone --nproc_per_node="$NPROC_PER_NODE" train_gpt.py
 
 echo "Done. Check logs/${RUN_ID}.txt for metrics."
 
