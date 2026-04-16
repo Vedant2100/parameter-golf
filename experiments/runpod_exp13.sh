@@ -30,7 +30,11 @@ echo "Tokenizer path: $TOKENIZER_PATH"
 
 if [ "$AUTO_SETUP_ENV" = "1" ]; then
   if command -v python3 >/dev/null 2>&1; then
-    if [ ! -x "$VENV_PATH/bin/python" ]; then
+    if [ -d "$VENV_PATH" ] && { [ ! -x "$VENV_PATH/bin/python" ] || [ ! -f "$VENV_PATH/bin/activate" ]; }; then
+      echo "Detected incomplete venv at: $VENV_PATH; recreating."
+      rm -rf "$VENV_PATH"
+    fi
+    if [ ! -x "$VENV_PATH/bin/python" ] || [ ! -f "$VENV_PATH/bin/activate" ]; then
       echo "Creating persistent venv at: $VENV_PATH"
       if ! python3 -m venv --help >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
