@@ -19,35 +19,36 @@ AUTO_SEND_BACK="${AUTO_SEND_BACK:-1}"
 SEND_INCLUDE_FULL_LOGS="${SEND_INCLUDE_FULL_LOGS:-1}"
 AUTO_SETUP_ENV="${AUTO_SETUP_ENV:-1}"
 VENV_PATH="${VENV_PATH:-/workspace/venv}"
+HF_HOME="${HF_HOME:-/workspace/hf-home}"
+export HF_HOME
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 
 echo "Repo root: $REPO_ROOT"
 echo "Run ID: $RUN_ID"
 echo "Data path: $DATA_PATH"
 echo "Tokenizer path: $TOKENIZER_PATH"
 
-if [ ! -f "$TOKENIZER_PATH" ] || [ ! -d "$DATA_PATH" ]; then
-  echo "Dataset/tokenizer missing. Downloading sp1024 artifacts..."
-  python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
-fi
-
-if [ ! -f "$TOKENIZER_PATH" ]; then
-  echo "Tokenizer still missing at: $TOKENIZER_PATH"
-  exit 1
-fi
-
-if [ ! -d "$DATA_PATH" ]; then
-  echo "Dataset dir still missing at: $DATA_PATH"
-  exit 1
-fi
-
 if [ "$AUTO_SETUP_ENV" = "1" ]; then
   if command -v python3 >/dev/null 2>&1; then
     if [ ! -x "$VENV_PATH/bin/python" ]; then
       echo "Creating persistent venv at: $VENV_PATH"
+      if ! python3 -m venv --help >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+          echo "Installing python3-venv and python3-pip..."
+          apt-get update && apt-get install -y python3-venv python3-pip
+        else
+          echo "python3-venv is missing and apt-get is unavailable."
+          exit 1
+        fi
+      fi
       python3 -m venv "$VENV_PATH"
     fi
     # shellcheck disable=SC1090
     source "$VENV_PATH/bin/activate"
+
+    if ! python -m pip --version >/dev/null 2>&1; then
+      python -m ensurepip --upgrade || true
+    fi
 
     if ! python -c "import torch" >/dev/null 2>&1; then
       echo "PyTorch not found in venv; installing runtime dependencies..."
@@ -59,6 +60,29 @@ if [ "$AUTO_SETUP_ENV" = "1" ]; then
     echo "AUTO_SETUP_ENV=1 but python3 is not available in PATH."
     exit 1
   fi
+fi
+
+PY_BIN="python3"
+if [ "$AUTO_SETUP_ENV" = "1" ] && command -v python >/dev/null 2>&1; then
+  PY_BIN="python"
+fi
+
+if [ ! -f "$TOKENIZER_PATH" ] || [ ! -d "$DATA_PATH" ]; then
+  echo "Dataset/tokenizer missing. Downloading sp1024 artifacts..."
+  if ! "$PY_BIN" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"; then
+    sed -i "s/-> list\\[str\\]/-> list/g" data/cached_challenge_fineweb.py
+  fi
+  "$PY_BIN" data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
+fi
+
+if [ ! -f "$TOKENIZER_PATH" ]; then
+  echo "Tokenizer still missing at: $TOKENIZER_PATH"
+  exit 1
+fi
+
+if [ ! -d "$DATA_PATH" ]; then
+  echo "Dataset dir still missing at: $DATA_PATH"
+  exit 1
 fi
 
 echo "Starting torchrun on 8 GPUs..."
