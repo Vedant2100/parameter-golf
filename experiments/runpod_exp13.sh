@@ -39,6 +39,21 @@ if [ ! -d "$DATA_PATH" ]; then
 fi
 
 echo "Starting torchrun on 8 GPUs..."
+TORCH_LAUNCHER=()
+if command -v torchrun >/dev/null 2>&1; then
+  TORCH_LAUNCHER=(torchrun)
+else
+  if command -v python3 >/dev/null 2>&1; then
+    TORCH_LAUNCHER=(python3 -m torch.distributed.run)
+  elif command -v python >/dev/null 2>&1; then
+    TORCH_LAUNCHER=(python -m torch.distributed.run)
+  else
+    echo "Neither torchrun nor python is available in PATH."
+    exit 1
+  fi
+  echo "torchrun not found; using fallback launcher: ${TORCH_LAUNCHER[*]}"
+fi
+
 RUN_ID="$RUN_ID" \
 DATA_PATH="$DATA_PATH" \
 TOKENIZER_PATH="$TOKENIZER_PATH" \
@@ -62,7 +77,7 @@ QK_GAIN_INIT="${QK_GAIN_INIT:-2.5}" \
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}" \
 EMA_DECAY="${EMA_DECAY:-0.995}" \
 EMA_START_STEP="${EMA_START_STEP:-1000}" \
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+"${TORCH_LAUNCHER[@]}" --standalone --nproc_per_node=8 train_gpt.py
 
 echo "Done. Check logs/${RUN_ID}.txt for metrics."
 
