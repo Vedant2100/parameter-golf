@@ -17,6 +17,8 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-$REPO_ROOT/data/tokenizers/fineweb_1024_bpe.mo
 RUN_ID="${RUN_ID:-exp_13_runpod_8xh100}"
 AUTO_SEND_BACK="${AUTO_SEND_BACK:-1}"
 SEND_INCLUDE_FULL_LOGS="${SEND_INCLUDE_FULL_LOGS:-1}"
+AUTO_SETUP_ENV="${AUTO_SETUP_ENV:-1}"
+VENV_PATH="${VENV_PATH:-/workspace/venv}"
 
 echo "Repo root: $REPO_ROOT"
 echo "Run ID: $RUN_ID"
@@ -36,6 +38,27 @@ fi
 if [ ! -d "$DATA_PATH" ]; then
   echo "Dataset dir still missing at: $DATA_PATH"
   exit 1
+fi
+
+if [ "$AUTO_SETUP_ENV" = "1" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    if [ ! -x "$VENV_PATH/bin/python" ]; then
+      echo "Creating persistent venv at: $VENV_PATH"
+      python3 -m venv "$VENV_PATH"
+    fi
+    # shellcheck disable=SC1090
+    source "$VENV_PATH/bin/activate"
+
+    if ! python -c "import torch" >/dev/null 2>&1; then
+      echo "PyTorch not found in venv; installing runtime dependencies..."
+      python -m pip install --upgrade pip
+      python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+      python -m pip install --no-cache-dir -r requirements.txt
+    fi
+  else
+    echo "AUTO_SETUP_ENV=1 but python3 is not available in PATH."
+    exit 1
+  fi
 fi
 
 echo "Starting torchrun on 8 GPUs..."
