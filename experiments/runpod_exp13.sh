@@ -18,10 +18,18 @@ RUN_ID="${RUN_ID:-exp_13_runpod_8xh100}"
 AUTO_SEND_BACK="${AUTO_SEND_BACK:-1}"
 SEND_INCLUDE_FULL_LOGS="${SEND_INCLUDE_FULL_LOGS:-1}"
 AUTO_SETUP_ENV="${AUTO_SETUP_ENV:-1}"
-VENV_PATH="${VENV_PATH:-/workspace/venv}"
+PYDEPS_PATH="${PYDEPS_PATH:-/workspace/pydeps}"
 HF_HOME="${HF_HOME:-/workspace/hf-home}"
 export HF_HOME
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
+mkdir -p "$PYDEPS_PATH"
+export PYTHONPATH="$PYDEPS_PATH:${PYTHONPATH:-}"
+export PATH="$PYDEPS_PATH/bin:$PATH"
+PIP_TMPDIR="${PIP_TMPDIR:-/workspace/pip-tmp}"
+mkdir -p "$PIP_TMPDIR"
+export TMPDIR="$PIP_TMPDIR"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pip-cache}"
+mkdir -p "$PIP_CACHE_DIR"
 
 echo "Repo root: $REPO_ROOT"
 echo "Run ID: $RUN_ID"
@@ -29,41 +37,26 @@ echo "Data path: $DATA_PATH"
 echo "Tokenizer path: $TOKENIZER_PATH"
 
 if [ "$AUTO_SETUP_ENV" = "1" ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    if [ -d "$VENV_PATH" ] && { [ ! -x "$VENV_PATH/bin/python" ] || [ ! -f "$VENV_PATH/bin/activate" ]; }; then
-      echo "Detected incomplete venv at: $VENV_PATH; recreating."
-      rm -rf "$VENV_PATH"
-    fi
-    if [ ! -x "$VENV_PATH/bin/python" ] || [ ! -f "$VENV_PATH/bin/activate" ]; then
-      echo "Creating persistent venv at: $VENV_PATH"
-      PY_MAJMIN="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-      if ! python3 -m venv "$VENV_PATH" 2>/dev/null; then
-        echo "venv creation failed; attempting to install python${PY_MAJMIN}-venv..."
-        if command -v apt-get >/dev/null 2>&1; then
-          apt-get update
-          apt-get install -y "python${PY_MAJMIN}-venv" python3-venv python3-pip || \
-            apt-get install -y python3-venv python3-pip
-        fi
-        rm -rf "$VENV_PATH"
-        python3 -m venv "$VENV_PATH"
-      fi
-    fi
-    # shellcheck disable=SC1090
-    source "$VENV_PATH/bin/activate"
-
-    if ! python -m pip --version >/dev/null 2>&1; then
-      python -m ensurepip --upgrade || true
-    fi
-
-    if ! python -c "import torch" >/dev/null 2>&1; then
-      echo "PyTorch not found in venv; installing runtime dependencies..."
-      python -m pip install --upgrade pip
-      python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-      python -m pip install --no-cache-dir -r requirements.txt
-    fi
-  else
+  if ! command -v python3 >/dev/null 2>&1; then
     echo "AUTO_SETUP_ENV=1 but python3 is not available in PATH."
     exit 1
+  fi
+
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    echo "pip not available for python3; installing..."
+    python3 -m ensurepip --upgrade 2>/dev/null || {
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y python3-pip
+      fi
+    }
+  fi
+
+  if ! python3 -c "import torch" >/dev/null 2>&1; then
+    echo "PyTorch not found; installing into persistent deps dir: $PYDEPS_PATH"
+    python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" --upgrade pip setuptools wheel || true
+    python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" \
+      torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" -r requirements.txt
   fi
 fi
 
