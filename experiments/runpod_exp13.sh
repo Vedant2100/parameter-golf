@@ -36,16 +36,17 @@ if [ "$AUTO_SETUP_ENV" = "1" ]; then
     fi
     if [ ! -x "$VENV_PATH/bin/python" ] || [ ! -f "$VENV_PATH/bin/activate" ]; then
       echo "Creating persistent venv at: $VENV_PATH"
-      if ! python3 -m venv --help >/dev/null 2>&1; then
+      PY_MAJMIN="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+      if ! python3 -m venv "$VENV_PATH" 2>/dev/null; then
+        echo "venv creation failed; attempting to install python${PY_MAJMIN}-venv..."
         if command -v apt-get >/dev/null 2>&1; then
-          echo "Installing python3-venv and python3-pip..."
-          apt-get update && apt-get install -y python3-venv python3-pip
-        else
-          echo "python3-venv is missing and apt-get is unavailable."
-          exit 1
+          apt-get update
+          apt-get install -y "python${PY_MAJMIN}-venv" python3-venv python3-pip || \
+            apt-get install -y python3-venv python3-pip
         fi
+        rm -rf "$VENV_PATH"
+        python3 -m venv "$VENV_PATH"
       fi
-      python3 -m venv "$VENV_PATH"
     fi
     # shellcheck disable=SC1090
     source "$VENV_PATH/bin/activate"
