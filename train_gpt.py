@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import hashlib
 import math
 import os
 import random
@@ -65,10 +66,17 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    # Depth recurrence controls.
+    # DEPTH_RECURRENCE repeats either:
+    # - the whole stack in a compressed round-robin mode (default), or
+    # - a specific layer window when RECURRENCE_START_LAYER/END_LAYER are set (1-indexed).
+    depth_recurrence = int(os.environ.get("DEPTH_RECURRENCE", "1"))
+    recurrence_start_layer = int(os.environ.get("RECURRENCE_START_LAYER", "-1"))
+    recurrence_end_layer = int(os.environ.get("RECURRENCE_END_LAYER", "-1"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -84,6 +92,9 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -110,10 +121,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        weight_decay: float = 0.0,
+        nesterov: bool = True,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                weight_decay=weight_decay,
+                nesterov=nesterov,
+            ),
         )
 
     @torch.no_grad()
@@ -134,6 +159,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
+            weight_decay = group["weight_decay"]
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
@@ -162,6 +188,8 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay > 0:
+                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -605,9 +633,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(mlp_mult * dim)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -639,9 +667,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        
+        # Parallel implementation: Both Attn and MLP run on the same input 'x'
+        # This improves hardware utilization on high-end GPUs like RTX 6000 Ada and H100.
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + \
+                self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -659,6 +692,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        depth_recurrence: int,
+        recurrence_start_layer: int,
+        recurrence_end_layer: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -669,6 +705,35 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
+        # Logical number of layers (may be larger than actual stored blocks when recurrence>1).
+        self.logical_num_layers = num_layers
+        self.depth_recurrence = max(1, int(depth_recurrence))
+        if recurrence_start_layer > 0 or recurrence_end_layer > 0:
+            if recurrence_start_layer < 1 or recurrence_end_layer < recurrence_start_layer:
+                raise ValueError(
+                    "RECURRENCE_START_LAYER/RECURRENCE_END_LAYER must be valid 1-indexed bounds"
+                )
+            recurrent_start = recurrence_start_layer - 1
+            recurrent_end = recurrence_end_layer - 1
+            if recurrent_end >= num_layers:
+                raise ValueError("RECURRENCE_END_LAYER must be <= NUM_LAYERS")
+            recurrent_len = recurrent_end - recurrent_start + 1
+            suffix_len = num_layers - recurrent_start - recurrent_len * self.depth_recurrence
+            if suffix_len < 0:
+                raise ValueError(
+                    "NUM_LAYERS too small for selected recurrence window and DEPTH_RECURRENCE"
+                )
+            unique_blocks = recurrent_start + recurrent_len + suffix_len
+            self.layer_to_block_idx = list(range(recurrent_start))
+            recurrent_block_idxs = list(range(recurrent_start, recurrent_start + recurrent_len))
+            for _ in range(self.depth_recurrence):
+                self.layer_to_block_idx.extend(recurrent_block_idxs)
+            suffix_start = recurrent_start + recurrent_len
+            self.layer_to_block_idx.extend(range(suffix_start, suffix_start + suffix_len))
+        else:
+            # Backward-compatible global recurrence: map logical depth to a compact set of blocks.
+            unique_blocks = max(1, (num_layers + self.depth_recurrence - 1) // self.depth_recurrence)
+            self.layer_to_block_idx = [i % unique_blocks for i in range(num_layers)]
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -681,7 +746,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(unique_blocks)
             ]
         )
         self.final_norm = RMSNorm()
@@ -705,12 +770,15 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            blk = self.blocks[self.layer_to_block_idx[i]]
+            x = blk(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            logical_idx = self.num_encoder_layers + i
+            blk = self.blocks[self.layer_to_block_idx[logical_idx]]
+            x = blk(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -733,7 +801,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if os.environ.get("USE_COMPILE", "1") == "1":
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -765,8 +834,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True) # Allowed as fallback
+    enable_math_sdp(True) # Allowed as fallback
 
     logfile = None
     if master_process:
@@ -783,7 +852,8 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    log0(code, console=False)
+    code_sha1 = hashlib.sha1(code.encode("utf-8")).hexdigest()
+    log0(f"code_sha1:{code_sha1} code_bytes:{len(code.encode('utf-8'))}", console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
@@ -835,13 +905,21 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        depth_recurrence=args.depth_recurrence,
+        recurrence_start_layer=args.recurrence_start_layer,
+        recurrence_end_layer=args.recurrence_end_layer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module
+    if os.environ.get("USE_COMPILE", "1") == "1":
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    else:
+        log0("USE_COMPILE=0: Running in eager mode (slower but safer).")
+        model = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -866,6 +944,7 @@ def main() -> None:
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -873,6 +952,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -880,6 +960,7 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -888,6 +969,7 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -895,13 +977,14 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} weight_decay:{args.weight_decay}"
     )
+    log0(f"ema:decay={args.ema_decay} start_step={args.ema_start_step}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -963,6 +1046,18 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+
+    ema_decay = float(args.ema_decay)
+    ema_enabled = 0.0 < ema_decay < 1.0
+    ema_params: dict[str, Tensor] | None = None
+    ema_updates = 0
+    if ema_enabled:
+        ema_params = {
+            name: p.detach().float().clone()
+            for name, p in base_model.named_parameters()
+            if p.requires_grad and p.is_floating_point()
+        }
+        log0(f"ema:enabled tracked_params={len(ema_params)}")
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1034,6 +1129,13 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if ema_enabled and ema_params is not None and step >= args.ema_start_step:
+            with torch.no_grad():
+                one_minus = 1.0 - ema_decay
+                for name, p in base_model.named_parameters():
+                    if name in ema_params:
+                        ema_params[name].mul_(ema_decay).add_(p.detach().float(), alpha=one_minus)
+            ema_updates += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1058,6 +1160,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if ema_enabled:
+        log0(f"ema:updates={ema_updates}")
+    if ema_enabled and ema_updates > 0 and ema_params is not None:
+        with torch.no_grad():
+            for name, p in base_model.named_parameters():
+                if name in ema_params:
+                    p.copy_(ema_params[name].to(dtype=p.dtype))
+        log0("ema:applied_to_model_for_final_eval")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
