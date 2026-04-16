@@ -9,7 +9,7 @@ set -euo pipefail
 #   AUTO_SEND_BACK=1 bash runpod_exp13.sh
 #   AUTO_SEND_BACK=1 SEND_INCLUDE_FULL_LOGS=0 bash runpod_exp13.sh
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 DATA_PATH="${DATA_PATH:-$REPO_ROOT/data/datasets/fineweb10B_sp1024/}"
