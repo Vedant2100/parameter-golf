@@ -61,6 +61,15 @@ if [ "$AUTO_SETUP_ENV" = "1" ]; then
     python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" -r "$REQ_TMP" || true
     rm -f "$REQ_TMP"
   fi
+
+  for mod_pkg in "sentencepiece:sentencepiece" "tiktoken:tiktoken" "huggingface_hub:huggingface-hub" "tqdm:tqdm" "numpy:numpy"; do
+    mod="${mod_pkg%%:*}"
+    pkg="${mod_pkg##*:}"
+    if ! python3 -c "import $mod" >/dev/null 2>&1; then
+      echo "Installing missing required package: $pkg"
+      python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" "$pkg"
+    fi
+  done
 fi
 
 PY_BIN="python3"
