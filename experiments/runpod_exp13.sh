@@ -56,7 +56,10 @@ if [ "$AUTO_SETUP_ENV" = "1" ]; then
     python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" --upgrade pip setuptools wheel || true
     python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" \
       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" -r requirements.txt
+    REQ_TMP="$(mktemp)"
+    grep -viE '^(kernels)(\s|==|$)' requirements.txt > "$REQ_TMP" || true
+    python3 -m pip install --no-cache-dir --target "$PYDEPS_PATH" -r "$REQ_TMP" || true
+    rm -f "$REQ_TMP"
   fi
 fi
 
