@@ -18,7 +18,10 @@ RUN_ID="${RUN_ID:-exp_13_runpod_8xh100}"
 AUTO_SEND_BACK="${AUTO_SEND_BACK:-1}"
 SEND_INCLUDE_FULL_LOGS="${SEND_INCLUDE_FULL_LOGS:-1}"
 AUTO_SETUP_ENV="${AUTO_SETUP_ENV:-1}"
-PYDEPS_PATH="${PYDEPS_PATH:-/workspace/pydeps}"
+AUTO_TERMINATE_POD="${AUTO_TERMINATE_POD:-1}"
+REQUIRE_AUTO_TERMINATE="${REQUIRE_AUTO_TERMINATE:-1}"
+PY_MAJMIN="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
+PYDEPS_PATH="${PYDEPS_PATH:-/workspace/pydeps-py${PY_MAJMIN}}"
 HF_HOME="${HF_HOME:-/workspace/hf-home}"
 export HF_HOME
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
@@ -35,6 +38,8 @@ echo "Repo root: $REPO_ROOT"
 echo "Run ID: $RUN_ID"
 echo "Data path: $DATA_PATH"
 echo "Tokenizer path: $TOKENIZER_PATH"
+echo "Python version: $PY_MAJMIN"
+echo "Python deps path: $PYDEPS_PATH"
 
 if [ "$AUTO_SETUP_ENV" = "1" ]; then
   if ! command -v python3 >/dev/null 2>&1; then
@@ -162,7 +167,25 @@ else
   echo "To send results back manually:"
   echo "  runpodctl send $OUTPUT_ARCHIVE"
 fi
-if command -v runpodctl >/dev/null 2>&1; then
-  echo "Terminating pod..."
-  runpodctl stop pod "$RUNPOD_POD_ID"
+if [ "$AUTO_TERMINATE_POD" = "1" ]; then
+  if ! command -v runpodctl >/dev/null 2>&1; then
+    msg="AUTO_TERMINATE_POD=1 but runpodctl is not available."
+    if [ "$REQUIRE_AUTO_TERMINATE" = "1" ]; then
+      echo "$msg"
+      exit 1
+    else
+      echo "$msg Skipping pod termination."
+    fi
+  elif [ -z "${RUNPOD_POD_ID:-}" ]; then
+    msg="AUTO_TERMINATE_POD=1 but RUNPOD_POD_ID is not set."
+    if [ "$REQUIRE_AUTO_TERMINATE" = "1" ]; then
+      echo "$msg"
+      exit 1
+    else
+      echo "$msg Skipping pod termination."
+    fi
+  else
+    echo "Terminating pod: $RUNPOD_POD_ID"
+    runpodctl stop pod "$RUNPOD_POD_ID"
+  fi
 fi
